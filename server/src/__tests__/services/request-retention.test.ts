@@ -123,4 +123,39 @@ describe('request analytics retention', () => {
     const remainingAfter = db.prepare(`SELECT hour FROM request_hourly ORDER BY hour`).all() as Array<{ hour: string }>;
     expect(remainingAfter.map(r => r.hour)).toEqual(['2026-05-15 00:00:00', '2026-05-31 00:00:00']);
   });
+
+  it('bounds the web-search attempt log by age and count', () => {
+    process.env.SEARCH_LOGS_RETENTION_DAYS = '7';
+    process.env.SEARCH_LOGS_MAX_ROWS = '2';
+    const db = getDb();
+    const insert = db.prepare(`
+      INSERT INTO search_requests (engine_id, platform, status, latency_ms, created_at)
+      VALUES ('tavily-search', 'tavily', 'ok', 10, ?)
+    `);
+    insert.run('2026-05-01 00:00:00'); // older than 7d from May 8
+    insert.run('2026-05-07 00:00:00');
+    insert.run('2026-05-07 23:00:00');
+    insert.run('2026-05-08 00:00:00');
+
+    const result = pruneRequestAnalytics({
+      db,
+      force: true,
+      now: new Date('2026-05-08T12:00:00Z'),
+    });
+    // Age prune drops May 1; the count cap then trims the rest to the newest 2.
+    expect(result.deleted).toBe(2);
+    const remaining = db.prepare(`SELECT created_at FROM search_requests ORDER BY created_at`).all() as Array<{ created_at: string }>;
+    expect(remaining.map(r => r.created_at)).toEqual(['2026-05-07 23:00:00', '2026-05-08 00:00:00']);
+  });
+
+  it('keeps search rows when both knobs are 0', () => {
+    process.env.SEARCH_LOGS_RETENTION_DAYS = '0';
+    process.env.SEARCH_LOGS_MAX_ROWS = '0';
+    const db = getDb();
+    db.prepare(`INSERT INTO search_requests (engine_id, platform, status, latency_ms, created_at)
+      VALUES ('tavily-search', 'tavily', 'ok', 10, '2020-01-01 00:00:00')`).run();
+
+    pruneRequestAnalytics({ db, force: true, now: new Date('2026-05-08T12:00:00Z') });
+    expect((db.prepare('SELECT COUNT(*) AS n FROM search_requests').get() as { n: number }).n).toBe(1);
+  });
 });
