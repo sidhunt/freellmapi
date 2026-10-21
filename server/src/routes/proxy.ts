@@ -469,6 +469,57 @@ proxyRouter.get('/models', (req: Request, res: Response) => {
   });
 });
 
+// OpenRouter-shaped model-limits endpoint. invisible_dots (and other clients
+// that speak the OpenRouter wire format) call GET /models/<id>/endpoints on
+// EVERY turn to learn the model's context window and max completion tokens
+// before running the turn — `provider.model_limits` aborts the request when
+// this endpoint is missing. The /v1/models listing already carries these
+// fields (`context_length` is OpenRouter's name for context_window), but the
+// per-model endpoints path is a separate call, so serve it here in OpenRouter's
+// shape for both the virtual ids (auto/fusion route a pool) and catalog rows.
+proxyRouter.get('/models/:model/endpoints', (req: Request, res: Response) => {
+  if (!requireInferenceAuth(req, res)) return;
+
+  const param = req.params.model;
+  const requested = Array.isArray(param) ? param[0] : param;
+  const lower = (requested ?? '').toLowerCase();
+
+  const { models: allListed, autoContextWindow } = buildModelListing();
+
+  // Virtual ids route to a pool, so their limit is the honest ceiling over
+  // everything routable right now. A concrete id looks itself up in the same
+  // listing the /v1/models endpoint serves.
+  const isVirtual =
+    lower === AUTO_MODEL_ID ||
+    lower === FUSION_MODEL_ID ||
+    lower.startsWith(`${AUTO_MODEL_ID}:`) ||
+    lower.startsWith(`${FUSION_MODEL_ID}:`);
+  const match = isVirtual ? undefined : allListed.find(m => m.id.toLowerCase() === lower);
+  const contextLength = isVirtual ? autoContextWindow : (match ? match.contextWindow : null);
+
+  if (contextLength == null) {
+    res.status(404).json({ error: { message: `Unknown model: ${requested}`, code: 404 } });
+    return;
+  }
+
+  res.json({
+    data: {
+      id: lower,
+      name: requested,
+      endpoints: [
+        {
+          context_length: contextLength,
+          // Per-turn output ceiling the engine may ask for. The gateway clamps
+          // this per routed model (routeOutputBudget), so a generous value is
+          // safe; the real spend guard is the Dot's max_cost_per_task_usd.
+          max_completion_tokens: 8192,
+          tag: 'freellmapi',
+        },
+      ],
+    },
+  });
+});
+
 
 const MAX_RETRIES = 20;
 
